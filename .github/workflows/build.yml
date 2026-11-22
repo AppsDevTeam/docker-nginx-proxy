@@ -1,0 +1,91 @@
+# Build a push appsdevteam/nginx-proxy na Docker Hub (amd64 + arm64).
+#
+# Tydenni rebuild kvuli bezpecnostnim opravam Alpine (`apk upgrade` v Dockerfile).
+# Tagy:
+# - <verze nginx>-<revize>-<YYYYMMDD> - neprepisuje se, obsah image je jednoznacne dany
+#   (datum buildu). Servery pinuji tenhle, bezpecnostni oprava = vedomy bump data.
+# - <verze nginx>-<revize> a latest - plovouci, vzdy posledni build.
+# Zmena image, ktera muze rozbit proxy (odebrany modul, jine chovani), = zvysit REVISION.
+#
+# Pred pushem se amd64 image otestuje (test/smoke.sh) a proleze trivy - opravitelna
+# CRITICAL CVE push zastavi (radeji stary image nez novy se znamou dirou).
+#
+# Akce jsou pinovane na SHA commitu (verze v komentari) - workflow ma token s pravem push
+# do appsdevteam/nginx-proxy, prevzaty tag akce by jinak podstrcil image vsem proxy.
+# Aktualizace navrhuje Dependabot (.github/dependabot.yml).
+#
+# Potrebuje secrets DOCKERHUB_USERNAME a DOCKERHUB_TOKEN.
+name: build
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # pondeli 04:30 UTC (po docker-php, aby se nepraly o runner minuty)
+    - cron: '30 4 * * 1'
+  workflow_dispatch:
+
+env:
+  REVISION: 1
+  IMAGE: appsdevteam/nginx-proxy
+  TRIVY_IMAGE: aquasec/trivy:0.76.2
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      # bez cache: tydenni rebuild musi znovu stahnout base image i apk balicky
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          platforms: linux/amd64
+          no-cache: true
+          pull: true
+          load: true
+          tags: nginx-proxy:test
+
+      - run: test/smoke.sh nginx-proxy:test
+
+      - name: trivy
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY_IMAGE" image \
+            --scanners vuln --ignore-unfixed --severity CRITICAL --exit-code 1 nginx-proxy:test
+
+      # Datovy tag je neprepisovatelny - druhy build v tentyz den by pod stejnym jmenem
+      # podstrcil jiny obsah, takze se ten den uz nepushuje.
+      - id: tags
+        run: |
+          nginx=$(docker run --rm nginx-proxy:test nginx -v 2>&1 | sed -n 's|^nginx version: nginx/||p')
+          [ -n "$nginx" ] || { echo "::error::verze nginx nezjistena"; exit 1; }
+          dated="$IMAGE:$nginx-$REVISION-$(date -u +%Y%m%d)"
+          if docker manifest inspect "$dated" > /dev/null 2>&1; then
+            echo "::warning::$dated uz existuje, datove tagy se neprepisuji - preskoceno"
+            exit 0
+          fi
+          {
+            echo "push=1"
+            echo "tags<<EOF"
+            echo "$dated"
+            echo "$IMAGE:$nginx-$REVISION"
+            echo "$IMAGE:latest"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - if: steps.tags.outputs.push == '1'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # amd64 vrstvy jdou z cache builderu - pushne se presne otestovany image
+      - if: steps.tags.outputs.push == '1'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
